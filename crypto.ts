@@ -8,7 +8,7 @@
  *
  * Key hierarchy:
  * 1. User enters password
- * 2. Argon2id(password, salt) → Master Key (never leaves client)
+ * 2. PBKDF2(password, salt, 600K) → Master Key
  * 3. HKDF(masterKey, "file-encryption") → File Encryption Key
  * 4. HKDF(masterKey, "metadata-encryption") → Metadata Key
  * 5. Each file gets a random IV (AES-256-GCM)
