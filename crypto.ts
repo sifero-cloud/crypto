@@ -1,6 +1,6 @@
 /**
  * ═══════════════════════════════════════════════
- * SIFERO CLOUD - Client-Side Zero-Knowledge Crypto
+ * SIFERO CLOUD — Client-Side Zero-Knowledge Crypto
  * ═══════════════════════════════════════════════
  *
  * ALL encryption/decryption happens HERE, in the browser.
@@ -133,7 +133,61 @@ export async function verifyMetadata(
 ): Promise<boolean> {
   const data = new TextEncoder().encode(fileId + ':' + encryptedName + ':' + encryptedMeta);
   const sig = base64ToBuffer(signature);
-  return crypto.subtle.verify('HMAC', signingKey, sig, data);
+  return crypto.subtle.verify('HMAC', signingKey, sig as BufferSource, data as BufferSource);
+}
+
+// ═══════════════════════════════════════
+// PER-FILE DEK (Data Encryption Key)
+// ═══════════════════════════════════════
+
+/** Generate a random 256-bit DEK for a single file */
+export async function generateDEK(): Promise<CryptoKey> {
+  return crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    true, // extractable — needed for wrapping
+    ['encrypt', 'decrypt']
+  );
+}
+
+/** Wrap (encrypt) a DEK with the user's file-encryption key */
+export async function wrapDEK(
+  fileKey: CryptoKey,
+  dek: CryptoKey
+): Promise<string> {
+  const rawDEK = await crypto.subtle.exportKey('raw', dek);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const wrapped = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv as BufferSource },
+    fileKey,
+    rawDEK
+  );
+  // Format: base64(iv + wrapped)
+  const combined = new Uint8Array(iv.length + wrapped.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(wrapped), iv.length);
+  return bufferToBase64(combined);
+}
+
+/** Unwrap (decrypt) a DEK using the user's file-encryption key */
+export async function unwrapDEK(
+  fileKey: CryptoKey,
+  wrappedDEKBase64: string
+): Promise<CryptoKey> {
+  const data = base64ToBuffer(wrappedDEKBase64);
+  const iv = data.slice(0, 12);
+  const wrapped = data.slice(12);
+  const rawDEK = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: iv as BufferSource },
+    fileKey,
+    wrapped as BufferSource
+  );
+  return crypto.subtle.importKey(
+    'raw',
+    rawDEK,
+    { name: 'AES-GCM', length: 256 },
+    false, // non-extractable after unwrap
+    ['encrypt', 'decrypt']
+  );
 }
 
 // ═══════════════════════════════════════
@@ -293,10 +347,11 @@ async function importShareKey(shareKeyHex: string, usages: KeyUsage[]): Promise<
 /** Encrypt file data with a share-specific key */
 export async function encryptForShare(
   shareKeyHex: string,
-  plaintext: ArrayBuffer
+  plaintext: ArrayBuffer,
+  shareId?: string
 ): Promise<Blob> {
   const key = await importShareKey(shareKeyHex, ['encrypt']);
-  return encryptFile(key, plaintext);
+  return encryptFile(key, plaintext, shareId);
 }
 
 /** Encrypt filename with share key (for share metadata) */
