@@ -117,7 +117,7 @@ MIT License - see [LICENSE](LICENSE)
 
 We welcome independent security audits and run periodic [Encryption Challenges](https://sifero.cloud/challenge.html) to publicly verify our encryption strength.
 
-If you find a vulnerability, please report it to security@sifero.cloud.
+If you find a vulnerability, please report it to admin@sifero.cloud.
 
 ---
 
