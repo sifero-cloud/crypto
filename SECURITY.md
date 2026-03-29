@@ -4,7 +4,7 @@
 
 If you discover a security vulnerability in Sifero Cloud's cryptographic implementation, please report it responsibly.
 
-**Email:** security@sifero.cloud
+**Email:** admin@sifero.cloud
 
 **What to include:**
 - Description of the vulnerability
