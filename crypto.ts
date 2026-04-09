@@ -1,47 +1,57 @@
-/**
- * ═══════════════════════════════════════════════
- * SIFERO CLOUD — Client-Side Zero-Knowledge Crypto
- * ═══════════════════════════════════════════════
- *
- * ALL encryption/decryption happens HERE, in the browser.
- * The server NEVER sees plaintext data.
- *
- * Key hierarchy:
- * 1. User enters password
- * 2. PBKDF2(password, salt, 600K) → Master Key (never leaves client)
- * 3. HKDF(masterKey, "file-encryption") → File Encryption Key
- * 4. HKDF(masterKey, "metadata-encryption") → Metadata Key
- * 5. HKDF(masterKey, "metadata-signing") → HMAC Signing Key
- * 6. Each file gets a random IV (AES-256-GCM) with AAD binding
- *
- * What server stores:
- * - Salt (public, needed for key derivation)
- * - Encrypted blobs (ciphertext)
- * - Encrypted metadata (ciphertext)
- * Server CANNOT decrypt anything without the master password.
- */
+import { argon2id } from "hash-wasm";
 
-// ═══════════════════════════════════════
-// KEY DERIVATION
-// ═══════════════════════════════════════
-
-/** Generate a random salt for new users */
 export function generateSalt(): string {
   const salt = crypto.getRandomValues(new Uint8Array(32));
   return bufferToBase64(salt);
 }
 
-/** Derive master key from password using PBKDF2 (Web Crypto API)
- *  PBKDF2-SHA256 with 600,000 iterations (OWASP recommended minimum)
- *  Argon2id is used separately for server-side password verification */
+export async function hashPasswordClient(password: string, saltBase64: string): Promise<string> {
+  const salt = base64ToBuffer(saltBase64);
+  const hash = await argon2id({
+    password,
+    salt,
+    parallelism: 4,
+    iterations: 3,
+    memorySize: 65536,
+    hashLength: 32,
+    outputType: "encoded",
+  });
+  return hash;
+}
+
+export async function verifyPasswordClient(password: string, saltBase64: string, storedHash: string): Promise<boolean> {
+  const computed = await hashPasswordClient(password, saltBase64);
+  return computed === storedHash;
+}
+
 export async function deriveMasterKey(
   password: string,
-  saltBase64: string
+  saltBase64: string,
+  kdfVersion?: number
 ): Promise<CryptoKey> {
-  const encoder = new TextEncoder();
   const salt = base64ToBuffer(saltBase64);
 
-  // Import password as key material
+  if (kdfVersion && kdfVersion >= 2) {
+    const keyBytes = await argon2id({
+      password,
+      salt,
+      parallelism: 4,
+      iterations: 3,
+      memorySize: 65536,
+      hashLength: 32,
+      outputType: "binary",
+    });
+
+    return crypto.subtle.importKey(
+      'raw',
+      new Uint8Array(keyBytes) as unknown as ArrayBuffer,
+      { name: 'AES-GCM', length: 256 },
+      true,
+      ['encrypt', 'decrypt']
+    );
+  }
+
+  const encoder = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
     encoder.encode(password),
@@ -50,30 +60,28 @@ export async function deriveMasterKey(
     ['deriveKey']
   );
 
-  // Derive master key with PBKDF2
   return crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
       salt: salt as BufferSource,
-      iterations: 600_000, // OWASP recommended minimum
+      iterations: 600_000,
       hash: 'SHA-256',
     },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
-    true, // extractable for sub-key derivation
+    true,
     ['encrypt', 'decrypt']
   );
 }
 
-/** Derive a sub-key for specific purpose (file encryption, metadata, etc.) */
 export async function deriveSubKey(
   masterKey: CryptoKey,
-  purpose: string
+  purpose: string,
+  userSalt?: string
 ): Promise<CryptoKey> {
   const encoder = new TextEncoder();
   const masterKeyRaw = await crypto.subtle.exportKey('raw', masterKey);
 
-  // Import as HKDF key material
   const hkdfKey = await crypto.subtle.importKey(
     'raw',
     masterKeyRaw,
@@ -82,11 +90,13 @@ export async function deriveSubKey(
     ['deriveKey']
   );
 
+  const salt = userSalt ? base64ToBuffer(userSalt) : encoder.encode('darkcloud-v1');
+
   return crypto.subtle.deriveKey(
     {
       name: 'HKDF',
       hash: 'SHA-256',
-      salt: encoder.encode('darkcloud-v1'),
+      salt: salt as BufferSource,
       info: encoder.encode(purpose),
     },
     hkdfKey,
@@ -96,14 +106,15 @@ export async function deriveSubKey(
   );
 }
 
-/** Derive HMAC signing key for metadata integrity */
 export async function deriveSigningKey(
-  masterKey: CryptoKey
+  masterKey: CryptoKey,
+  userSalt?: string
 ): Promise<CryptoKey> {
   const masterKeyRaw = await crypto.subtle.exportKey('raw', masterKey);
   const hkdfKey = await crypto.subtle.importKey('raw', masterKeyRaw, 'HKDF', false, ['deriveKey']);
+  const salt = userSalt ? base64ToBuffer(userSalt) : new TextEncoder().encode('darkcloud-v1');
   return crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt: new TextEncoder().encode('darkcloud-v1'), info: new TextEncoder().encode('metadata-signing') },
+    { name: 'HKDF', hash: 'SHA-256', salt: salt as BufferSource, info: new TextEncoder().encode('metadata-signing') },
     hkdfKey,
     { name: 'HMAC', hash: 'SHA-256', length: 256 },
     false,
@@ -111,7 +122,6 @@ export async function deriveSigningKey(
   );
 }
 
-/** Sign metadata with HMAC-SHA256 */
 export async function signMetadata(
   signingKey: CryptoKey,
   fileId: string,
@@ -123,7 +133,6 @@ export async function signMetadata(
   return bufferToBase64(new Uint8Array(sig));
 }
 
-/** Verify metadata HMAC signature */
 export async function verifyMetadata(
   signingKey: CryptoKey,
   fileId: string,
@@ -136,20 +145,14 @@ export async function verifyMetadata(
   return crypto.subtle.verify('HMAC', signingKey, sig as BufferSource, data as BufferSource);
 }
 
-// ═══════════════════════════════════════
-// PER-FILE DEK (Data Encryption Key)
-// ═══════════════════════════════════════
-
-/** Generate a random 256-bit DEK for a single file */
 export async function generateDEK(): Promise<CryptoKey> {
   return crypto.subtle.generateKey(
     { name: 'AES-GCM', length: 256 },
-    true, // extractable — needed for wrapping
+    true,
     ['encrypt', 'decrypt']
   );
 }
 
-/** Wrap (encrypt) a DEK with the user's file-encryption key */
 export async function wrapDEK(
   fileKey: CryptoKey,
   dek: CryptoKey
@@ -161,14 +164,12 @@ export async function wrapDEK(
     fileKey,
     rawDEK
   );
-  // Format: base64(iv + wrapped)
   const combined = new Uint8Array(iv.length + wrapped.byteLength);
   combined.set(iv, 0);
   combined.set(new Uint8Array(wrapped), iv.length);
   return bufferToBase64(combined);
 }
 
-/** Unwrap (decrypt) a DEK using the user's file-encryption key */
 export async function unwrapDEK(
   fileKey: CryptoKey,
   wrappedDEKBase64: string
@@ -185,26 +186,21 @@ export async function unwrapDEK(
     'raw',
     rawDEK,
     { name: 'AES-GCM', length: 256 },
-    false, // non-extractable after unwrap
+    false,
     ['encrypt', 'decrypt']
   );
 }
 
-// ═══════════════════════════════════════
-// ENCRYPTION / DECRYPTION
-// ═══════════════════════════════════════
-
 export interface EncryptedData {
-  ciphertext: string;  // Base64
-  iv: string;          // Base64
+  ciphertext: string;
+  iv: string;
 }
 
-/** Encrypt data with AES-256-GCM */
 export async function encrypt(
   key: CryptoKey,
   plaintext: ArrayBuffer
 ): Promise<EncryptedData> {
-  const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV for GCM
+  const iv = crypto.getRandomValues(new Uint8Array(12));
 
   const ciphertext = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: iv as BufferSource },
@@ -218,7 +214,6 @@ export async function encrypt(
   };
 }
 
-/** Decrypt data with AES-256-GCM */
 export async function decrypt(
   key: CryptoKey,
   encryptedData: EncryptedData
@@ -233,7 +228,6 @@ export async function decrypt(
   );
 }
 
-/** Encrypt a string (for filenames, metadata) */
 export async function encryptString(
   key: CryptoKey,
   text: string
@@ -243,7 +237,6 @@ export async function encryptString(
   return JSON.stringify(encrypted);
 }
 
-/** Decrypt a string */
 export async function decryptString(
   key: CryptoKey,
   encryptedJson: string
@@ -254,43 +247,29 @@ export async function decryptString(
   return decoder.decode(decrypted);
 }
 
-/** Encrypt a file (ArrayBuffer)
- *  Format v2 (with AAD): [0x02][12-byte IV][ciphertext+tag]
- *  Format v1 (legacy):   [12-byte IV][ciphertext+tag]
- *  AAD = fileId encoded as UTF-8, binds ciphertext to specific file (prevents swap attacks)
- */
 export async function encryptFile(
   key: CryptoKey,
   fileData: ArrayBuffer,
   fileId?: string
 ): Promise<Blob> {
+  if (!fileId) throw new Error("fileId is required for AAD binding");
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encoder = new TextEncoder();
-  const aad = fileId ? encoder.encode(fileId) : undefined;
+  const aad = encoder.encode(fileId);
 
   const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: iv as BufferSource, ...(aad ? { additionalData: aad as BufferSource } : {}) },
+    { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad as BufferSource },
     key,
     fileData
   );
 
-  if (aad) {
-    // v2 format: version byte + IV + ciphertext
-    const combined = new Uint8Array(1 + iv.length + ciphertext.byteLength);
-    combined[0] = 0x02; // version marker
-    combined.set(iv, 1);
-    combined.set(new Uint8Array(ciphertext), 1 + iv.length);
-    return new Blob([combined], { type: 'application/octet-stream' });
-  } else {
-    // v1 format (legacy): IV + ciphertext
-    const combined = new Uint8Array(iv.length + ciphertext.byteLength);
-    combined.set(iv, 0);
-    combined.set(new Uint8Array(ciphertext), iv.length);
-    return new Blob([combined], { type: 'application/octet-stream' });
-  }
+  const combined = new Uint8Array(1 + iv.length + ciphertext.byteLength);
+  combined[0] = 0x02;
+  combined.set(iv, 1);
+  combined.set(new Uint8Array(ciphertext), 1 + iv.length);
+  return new Blob([combined], { type: 'application/octet-stream' });
 }
 
-/** Decrypt a file - supports both v1 (no AAD) and v2 (with AAD) formats */
 export async function decryptFile(
   key: CryptoKey,
   encryptedBlob: ArrayBuffer,
@@ -299,9 +278,7 @@ export async function decryptFile(
   const data = new Uint8Array(encryptedBlob);
   const encoder = new TextEncoder();
 
-  // Check version marker
   if (data[0] === 0x02 && fileId) {
-    // v2 format: [0x02][12-byte IV][ciphertext+tag]
     const iv = data.slice(1, 13);
     const ciphertext = data.slice(13);
     const aad = encoder.encode(fileId);
@@ -312,7 +289,6 @@ export async function decryptFile(
     );
   }
 
-  // v1 format (legacy) or no fileId: [12-byte IV][ciphertext+tag]
   const iv = data.slice(0, 12);
   const ciphertext = data.slice(12);
   return crypto.subtle.decrypt(
@@ -322,17 +298,23 @@ export async function decryptFile(
   );
 }
 
-// ═══════════════════════════════════════
-// SHARE LINK CRYPTO
-// ═══════════════════════════════════════
-
-/** Generate a random key for share links (goes in URL fragment #) */
 export function generateShareKey(): string {
   const key = crypto.getRandomValues(new Uint8Array(32));
   return bufferToHex(key);
 }
 
-/** Import a share key from hex for encrypt/decrypt */
+export async function deriveShareKeyFromPassword(password: string, token: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']);
+  const salt = encoder.encode('sifero-share:' + token);
+  const key = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: salt as BufferSource, iterations: 100000, hash: 'SHA-256' },
+    keyMaterial, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']
+  );
+  const raw = await crypto.subtle.exportKey('raw', key);
+  return bufferToHex(new Uint8Array(raw));
+}
+
 async function importShareKey(shareKeyHex: string, usages: KeyUsage[]): Promise<CryptoKey> {
   const keyData = hexToBuffer(shareKeyHex);
   return crypto.subtle.importKey(
@@ -344,7 +326,6 @@ async function importShareKey(shareKeyHex: string, usages: KeyUsage[]): Promise<
   );
 }
 
-/** Encrypt file data with a share-specific key */
 export async function encryptForShare(
   shareKeyHex: string,
   plaintext: ArrayBuffer,
@@ -354,7 +335,6 @@ export async function encryptForShare(
   return encryptFile(key, plaintext, shareId);
 }
 
-/** Encrypt filename with share key (for share metadata) */
 export async function encryptNameForShare(
   shareKeyHex: string,
   fileName: string
@@ -363,7 +343,6 @@ export async function encryptNameForShare(
   return encryptString(key, fileName);
 }
 
-/** Decrypt shared file using key from URL fragment */
 export async function decryptShared(
   shareKeyHex: string,
   encryptedBlob: ArrayBuffer
@@ -372,7 +351,6 @@ export async function decryptShared(
   return decryptFile(key, encryptedBlob);
 }
 
-/** Decrypt shared filename using key from URL fragment */
 export async function decryptNameFromShare(
   shareKeyHex: string,
   encryptedName: string
@@ -380,10 +358,6 @@ export async function decryptNameFromShare(
   const key = await importShareKey(shareKeyHex, ['decrypt']);
   return decryptString(key, encryptedName);
 }
-
-// ═══════════════════════════════════════
-// UTILITY FUNCTIONS
-// ═══════════════════════════════════════
 
 function bufferToBase64(buffer: Uint8Array): string {
   let binary = '';
@@ -416,11 +390,66 @@ function hexToBuffer(hex: string): Uint8Array {
   return bytes;
 }
 
-/** Format file size for display */
 export function formatFileSize(bytes: number): string {
   if (bytes === 0) return '0 B';
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+
+export async function generateDropKeyPair(): Promise<{ publicKey: string; privateKey: string }> {
+  const keyPair = await crypto.subtle.generateKey(
+    { name: "RSA-OAEP", modulusLength: 4096, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+    true,
+    ["encrypt", "decrypt"]
+  );
+  const pubRaw = await crypto.subtle.exportKey("spki", keyPair.publicKey);
+  const privRaw = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+  return { publicKey: bufferToBase64(new Uint8Array(pubRaw)), privateKey: bufferToBase64(new Uint8Array(privRaw)) };
+}
+
+export async function wrapDropPrivateKey(masterKey: CryptoKey, privateKeyBase64: string): Promise<string> {
+  const wrapKey = await deriveSubKey(masterKey, "dead-drop-wrap");
+  const encrypted = await encrypt(wrapKey, base64ToBuffer(privateKeyBase64).buffer as ArrayBuffer);
+  return JSON.stringify(encrypted);
+}
+
+export async function unwrapDropPrivateKey(masterKey: CryptoKey, wrappedJson: string): Promise<CryptoKey> {
+  const wrapKey = await deriveSubKey(masterKey, "dead-drop-wrap");
+  const decrypted = await decrypt(wrapKey, JSON.parse(wrappedJson));
+  return crypto.subtle.importKey("pkcs8", decrypted, { name: "RSA-OAEP", hash: "SHA-256" }, false, ["decrypt"]);
+}
+
+export async function importDropPublicKey(publicKeyBase64: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey("spki", base64ToBuffer(publicKeyBase64).buffer as ArrayBuffer, { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"]);
+}
+
+export async function encryptForDrop(publicKey: CryptoKey, data: ArrayBuffer): Promise<Blob> {
+  const aesKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
+  const aesRaw = await crypto.subtle.exportKey("raw", aesKey);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, data);
+  const wrappedAesKey = await crypto.subtle.encrypt({ name: "RSA-OAEP" }, publicKey, aesRaw);
+  const wrappedKeyBytes = new Uint8Array(wrappedAesKey);
+  const wrappedKeyLen = new Uint8Array(2);
+  wrappedKeyLen[0] = (wrappedKeyBytes.length >> 8) & 0xff;
+  wrappedKeyLen[1] = wrappedKeyBytes.length & 0xff;
+  const combined = new Uint8Array(2 + wrappedKeyBytes.length + 12 + ciphertext.byteLength);
+  combined.set(wrappedKeyLen, 0);
+  combined.set(wrappedKeyBytes, 2);
+  combined.set(iv, 2 + wrappedKeyBytes.length);
+  combined.set(new Uint8Array(ciphertext), 2 + wrappedKeyBytes.length + 12);
+  return new Blob([combined], { type: "application/octet-stream" });
+}
+
+export async function decryptFromDrop(privateKey: CryptoKey, data: ArrayBuffer): Promise<ArrayBuffer> {
+  const bytes = new Uint8Array(data);
+  const wrappedKeyLen = (bytes[0] << 8) | bytes[1];
+  const wrappedAesKey = bytes.slice(2, 2 + wrappedKeyLen);
+  const iv = bytes.slice(2 + wrappedKeyLen, 2 + wrappedKeyLen + 12);
+  const ciphertext = bytes.slice(2 + wrappedKeyLen + 12);
+  const aesRaw = await crypto.subtle.decrypt({ name: "RSA-OAEP" }, privateKey, wrappedAesKey);
+  const aesKey = await crypto.subtle.importKey("raw", aesRaw, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  return crypto.subtle.decrypt({ name: "AES-GCM", iv }, aesKey, ciphertext);
 }

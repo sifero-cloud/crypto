@@ -12,115 +12,111 @@ All encryption happens **in your browser** before data leaves your device. The s
 Password (user's brain)
 |
 v
-PBKDF2 (600,000 iterations, SHA-256) -> Master Key (encryption)
-Argon2id (server-side auth hash) -> Password Verifier (login only)
+Argon2id (64MB, 3 iterations, 4 parallelism) -> Master Key (KDF v2)
+PBKDF2 (600,000 iterations, SHA-256)          -> Master Key (KDF v1, legacy)
+|
+Argon2id (client-side) -> Password Hash -> HMAC-SHA256 (server-side) -> Auth Verifier
 |
 v
-Master Key (256-bit, never leaves client)
+Master Key (256-bit AES, never leaves client)
 |
-|--- HKDF("file-encryption") -> File Encryption Key
-|--- HKDF("metadata-encryption") -> Metadata Key
-|--- HKDF("metadata-signing") -> HMAC Signing Key
-|--- HKDF("notes-encryption") -> Notes Key
-|--- HKDF("search-encryption") -> Search Index Key
-+--- HKDF("chat-encryption") -> Chat Key
+|--- HKDF(userSalt, "file-encryption")     -> File Encryption Key
+|--- HKDF(userSalt, "metadata-encryption") -> Metadata Key
+|--- HKDF(userSalt, "metadata-signing")    -> HMAC Signing Key (HMAC-SHA256)
+|--- HKDF(userSalt, "search-encryption")   -> Search Index Key
+|--- HKDF(userSalt, "chat-{roomId}")       -> Per-Room Chat Key
+|--- HKDF(userSalt, "dead-drop-wrap")      -> Dead Drop Key Wrapping Key
 |
 v
-AES-256-GCM (per-file random IV, with AAD binding)
-
+Per-File DEK (random AES-256-GCM key, wrapped with File Encryption Key)
+|
+v
+AES-256-GCM (random 12-byte IV, mandatory AAD binding to fileId)
 ```
-
 
 ## Key Derivation
 
-**PBKDF2** with 600,000 iterations converts your password into a master encryption key. This makes brute-force attacks computationally infeasible. The master key never leaves the browser.
+### Master Key (KDF)
+- **Argon2id** (v2, new users): 64MB memory, 3 iterations, 4 parallelism, 32-byte output
+- **PBKDF2** (v1, legacy): 600,000 iterations, SHA-256, 32-byte output
+- Salt is per-user, generated at registration, stored on server
 
-**Argon2id** is used separately for server-side password verification (login). The Argon2id hash cannot be used to derive encryption keys - these are two independent processes.
+### Sub-Key Derivation (HKDF)
+- **HKDF-SHA256** with per-user salt (HKDF v2) or static salt (HKDF v1, legacy)
+- Each purpose gets a separate derived key via `info` parameter
+- Sub-keys are non-extractable (cannot be exported from WebCrypto)
 
-**HKDF** (HMAC-based Key Derivation Function) derives separate sub-keys for each purpose, so compromising one doesn't compromise others.
+### Authentication (separate from encryption)
+- Client computes `Argon2id(password, authSalt)` -> sends hash to server
+- Server applies `HMAC-SHA256(jwtSecret, clientHash)` -> stores result
+- Server never sees the raw password
+- Timing-safe comparison (`crypto.timingSafeEqual`) for all hash checks
 
 ## Encryption
 
-**AES-256-GCM** (Galois/Counter Mode) provides both confidentiality and authenticity. Each encryption operation uses a cryptographically random 12-byte IV (Initialization Vector).
+### Files
+- **Per-file DEK**: Each file gets a unique random AES-256-GCM key (Data Encryption Key)
+- **DEK wrapping**: DEK is encrypted with the user's File Encryption Key (derived via HKDF)
+- **AAD binding**: File ID is bound as Additional Authenticated Data — prevents ciphertext swapping
+- **Format**: `[0x02][IV: 12 bytes][Ciphertext + GCM Tag]`
+- Legacy format (v1, no AAD): `[IV: 12 bytes][Ciphertext + GCM Tag]`
 
-**AAD (Additional Authenticated Data)**: New files are encrypted with the file ID bound as AAD, preventing ciphertext swap attacks where a malicious server could substitute one file's ciphertext for another.
+### Metadata
+- File names and metadata encrypted with Metadata Key (AES-256-GCM)
+- Stored as JSON: `{"ciphertext": "base64", "iv": "base64"}`
 
-Encrypted output format:
+### Metadata Signatures
+- HMAC-SHA256 over `fileId:encryptedName:encryptedMeta`
+- Signing key derived via HKDF with purpose `"metadata-signing"`
+- Client verifies signatures on download to detect tampering
 
-```
-v1 (legacy): [12 bytes IV][N bytes ciphertext][16 bytes auth tag]
-v2 (current): [0x02 version][12 bytes IV][N bytes ciphertext][16 bytes auth tag]
-```
+## Sharing
+- Random 256-bit share key generated per share link
+- File re-encrypted with share key (AES-256-GCM)
+- Share key transmitted in URL fragment (`#key`) — NOT sent to server
+- Optional password protection (Argon2id server-side)
 
+## Dead Drop (Anonymous File Receiving)
+- RSA-4096 OAEP key pair generated per drop
+- Public key shared publicly, private key wrapped with user's master key
+- Hybrid encryption: ephemeral AES-256-GCM key per file, wrapped with RSA public key
+- Format: `[wrappedKeyLen: 2 bytes][RSA-wrapped AES key][IV: 12 bytes][Ciphertext]`
 
-Both formats are supported for backward compatibility.
+## Chat (End-to-End Encryption)
+- Per-room key derived via HKDF with purpose `"chat-{roomId}"`
+- Messages encrypted with AES-256-GCM
+- Sender name encrypted within message payload
 
-## Metadata Integrity
-
-File metadata (encrypted names, types) is signed with **HMAC-SHA256** using a dedicated signing key derived via HKDF. This prevents a malicious server from tampering with file metadata without detection.
-
-## What Gets Encrypted
-
-| Data | Encrypted Client-Side | Key Used |
-|------|----------------------|----------|
-| File contents | Yes | file-encryption |
-| File names | Yes | metadata-encryption |
-| File metadata | Yes + HMAC signed | metadata-encryption + metadata-signing |
-| Notes (title + body) | Yes | notes-encryption |
-| Search index | Yes | search-encryption |
-| Chat messages | Yes | chat-encryption |
-
-## What The Server Sees
-
-- Encrypted blobs (indistinguishable from random bytes)
-- Argon2id password hash (for login verification only - cannot reverse to password or derive encryption keys)
-- File sizes and timestamps
-- User actions (upload, download, delete)
-- IP addresses and session metadata
-
-## What The Server Cannot See
-
-- File contents
-- File names
-- Note contents
-- Chat messages
-- Your password
-- Your encryption keys
-
-## Verification
-
-To verify this is the actual code running on sifero.cloud:
-
-1. Open https://sifero.cloud
-2. Open browser DevTools (F12) - Sources
-3. Search for `PBKDF2` or `AES-GCM`
-4. Compare with this repository
+## What the Server Stores
+| Data | Format | Server Can Read? |
+|------|--------|-----------------|
+| File content | AES-256-GCM ciphertext | No |
+| File name | AES-256-GCM ciphertext | No |
+| File metadata | AES-256-GCM ciphertext | No |
+| File size | Plaintext (bytes) | Yes |
+| Timestamps | Plaintext | Yes |
+| Wrapped DEK | AES-256-GCM ciphertext | No |
+| Password hash | HMAC(Argon2id(pw)) | No (cannot reverse) |
+| Key salt | Plaintext | Yes (public parameter) |
+| Auth salt | Plaintext | Yes (public parameter) |
+| Chat messages | AES-256-GCM ciphertext | No |
+| Notes | AES-256-GCM ciphertext | No |
+| Search index | AES-256-GCM ciphertext | No |
 
 ## Security Properties
-
-- **Password = Key**: If you forget your password, your data is permanently lost. We cannot recover it.
-- **No key escrow**: We never store, transmit, or have access to your encryption keys.
-- **Nonce uniqueness**: Each encryption operation uses a cryptographically random IV, so identical files produce different ciphertext.
-- **Authenticated encryption**: AES-GCM detects any tampering with encrypted data.
-- **AAD binding**: File ciphertext is cryptographically bound to the file ID, preventing swap attacks.
-- **Metadata signing**: HMAC signatures detect unauthorized changes to file metadata.
+- **Zero-Knowledge**: Server cannot decrypt any user data
+- **Forward secrecy**: Per-file DEKs limit exposure if one key is compromised
+- **Tamper detection**: HMAC signatures on metadata
+- **No downgrade**: v2 clients never fall back to weaker v1 encryption
+- **Timing-safe**: All hash comparisons use constant-time algorithms
+- **AAD binding**: Prevents ciphertext substitution attacks
 
 ## Dependencies
+- `hash-wasm` — Argon2id (WebAssembly, runs in browser)
+- `Web Crypto API` — AES-GCM, HKDF, PBKDF2, RSA-OAEP, HMAC (browser-native)
 
-Zero external cryptography dependencies. Uses only the [Web Crypto API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Crypto_API) built into every modern browser.
+## Audit Status
+This code is prepared for independent security audit. All cryptographic operations are contained in a single file (`crypto.ts`) for easy review.
 
 ## License
-
-MIT License - see [LICENSE](LICENSE)
-
-## Audit & Security
-
-We welcome independent security audits and run periodic [Encryption Challenges](https://sifero.cloud/challenge.html) to publicly verify our encryption strength.
-
-If you find a vulnerability, please report it to admin@sifero.cloud.
-
----
-
-**Sifero Cloud** - Zero-Knowledge Encrypted Cloud Storage
-https://sifero.cloud
-
+MIT — See [LICENSE](LICENSE)
